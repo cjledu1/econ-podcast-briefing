@@ -1,0 +1,88 @@
+name: Morning Economic Podcast Briefing (Mon/Wed/Fri 07:30 KST)
+
+on:
+  schedule:
+    - cron: '10 22 * * 0,2,4'
+  workflow_dispatch:
+    inputs:
+      force_fallback:
+        description: 'NotebookLM 생략 후 즉시 2인 멀티보이스 TTS 사용 여부'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-send-briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Auto-Fix Folder Structure (if uploaded inside econ-podcast-briefing-upload/)
+        run: |
+          if [ -d "econ-podcast-briefing-upload" ] && [ ! -f "main.py" ]; then
+            cp -rf econ-podcast-briefing-upload/* .
+            git rm -rf econ-podcast-briefing-upload
+          fi
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Audio Dependencies (ffmpeg) & Python Packages
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Generate 20-News Briefing, Audio Podcast & Web Player
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PUBLIC_WEB_URL: ${{ secrets.PUBLIC_WEB_URL }}
+          GOOGLE_STORAGE_STATE_B64: ${{ secrets.GOOGLE_STORAGE_STATE_B64 }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+        run: |
+          if [ "${{ github.event.inputs.force_fallback }}" = "true" ]; then
+            python main.py --force-fallback --skip-kakao
+          else
+            python main.py --skip-kakao
+          fi
+
+      - name: Commit & Push Updated Audio and Web Player to GitHub Pages (docs/)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(briefing): publish morning economic podcast ($(date +'%Y-%m-%d'))"
+            git push
+          fi
+
+      - name: Wait 20s for GitHub Pages CDN Propagation & Send KakaoTalk Notification
+        env:
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          PUBLIC_WEB_URL: ${{ secrets.PUBLIC_WEB_URL }}
+        run: |
+          sleep 20
+          python -c "
+          import json
+          from pathlib import Path
+          from src.config import PUBLIC_WEB_URL
+          from src.kakao_notifier import send_kakao_briefing
+          ep = json.loads(Path('docs/episodes/latest.json').read_text(encoding='utf-8'))
+          web_url = f'{PUBLIC_WEB_URL}/?ep={ep[\"date\"]}'
+          send_kakao_briefing(ep, ep.get('audio', {}), web_url)
+          "
