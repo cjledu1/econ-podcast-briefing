@@ -2,6 +2,7 @@ name: Morning Economic Podcast Briefing (Mon/Wed/Fri 07:30 KST)
 
 on:
   schedule:
+    # UTC 기준 일(0), 화(2), 목(4) 22:10 = 한국 시간(KST) 월, 수, 금 오전 07:10 시작 -> 약 15분 제작 후 07:25~07:30 카톡 도착
     - cron: '10 22 * * 0,2,4'
   workflow_dispatch:
     inputs:
@@ -19,7 +20,7 @@ permissions:
 jobs:
   build-and-send-briefing:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Repository
@@ -40,10 +41,8 @@ jobs:
 
       - name: Install System Audio Dependencies (ffmpeg) & Python Packages
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
+          which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          pip install -q -r requirements.txt
 
       - name: Generate 20-News Briefing, Audio Podcast & Web Player
         env:
