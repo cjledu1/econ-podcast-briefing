@@ -22,6 +22,32 @@ def clean_json_response(raw_text: str) -> str:
     return text.strip()
 
 
+def discover_text_models(client: Any) -> List[str]:
+    """API 키에서 사용 가능한 최신 Gemini Flash/Pro 텍스트 생성 모델 목록을 동적으로 탐색합니다."""
+    preferred = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
+    discovered: List[str] = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            if not name.startswith("gemini-"):
+                continue
+            low = name.lower()
+            if any(skip in low for skip in ("tts", "embedding", "imagen", "veo", "aqa", "vision")):
+                continue
+            if "flash" in low or "pro" in low:
+                discovered.append(name)
+        discovered.sort(reverse=True)
+        logger.info(f"[Gemini Models] 탐색된 텍스트 모델 목록: {discovered[:8]}")
+    except Exception as e:
+        logger.warning(f"[Gemini Models] 모델 목록 조회 실패 (기본 목록 사용): {e}")
+
+    ordered: List[str] = []
+    for m in preferred + discovered:
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
 def build_curation_prompt(articles: List[Dict[str, Any]], date_str: str, weekday_ko: str) -> str:
     articles_text = "\n".join(
         [
@@ -245,12 +271,14 @@ def generate_briefing_with_gemini(
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1beta"})
     curation_prompt = build_curation_prompt(articles, date_str, weekday_ko)
 
+    candidate_models = discover_text_models(client)
     briefing = None
-    active_model = "gemini-2.5-flash"
-    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+    active_model = candidate_models[0]
+
+    for model_name in candidate_models:
         try:
             logger.info(f"[Gemini Stage 1] {model_name} 모델로 20대 뉴스 선별 및 해설 생성 중...")
             response = client.models.generate_content(
@@ -264,12 +292,13 @@ def generate_briefing_with_gemini(
             )
             briefing = json.loads(clean_json_response(response.text))
             active_model = model_name
+            logger.info(f"[Gemini Stage 1] {model_name} 호출 성공!")
             break
         except Exception as e:
             logger.warning(f"[Gemini Stage 1] {model_name} 호출 실패: {e}")
 
     if not briefing or not briefing.get("news_items"):
-        raise RuntimeError("Gemini Stage 1 뉴스 선별 실패. GEMINI_API_KEY를 확인해 주세요.")
+        raise RuntimeError("모든 Gemini 모델 호출에 실패했습니다.")
 
     themes = briefing.get("themes", [])
     news_items = briefing.get("news_items", [])
@@ -289,7 +318,7 @@ def generate_briefing_with_gemini(
             weekday_ko=weekday_ko,
         )
         try:
-            logger.info(f"[Gemini Stage 2 - 파트 {idx+1}/{len(themes)}] '{theme.get('title')}' 초구어체 2인 대본 생성 중...")
+            logger.info(f"[Gemini Stage 2 - 파트 {idx+1}/{len(themes)}] '{theme.get('title')}' 초구어체 2인 대본 생성 중 ({active_model})...")
             resp_part = client.models.generate_content(
                 model=active_model,
                 contents=theme_prompt,
