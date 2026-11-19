@@ -1,6 +1,4 @@
 import asyncio
-import base64
-import json
 import logging
 import shutil
 import subprocess
@@ -12,8 +10,6 @@ from typing import Dict, Any, List, Tuple
 from src.config import (
     AUDIO_DIR,
     GEMINI_API_KEY,
-    GOOGLE_STORAGE_STATE_B64,
-    GOOGLE_STORAGE_STATE_PATH,
     HOST_PERSONAS,
     OUTPUT_DIR,
 )
@@ -32,24 +28,21 @@ def cleanup_old_audio_files(keep_latest: int = 6) -> None:
 
 
 def discover_tts_models(client: Any) -> List[str]:
-    """API 키에서 사용 가능한 Gemini Multi-Speaker TTS / Audio 모델 목록을 동적으로 탐색합니다."""
+    """API 키에서 사용 가능한 Gemini Multi-Speaker TTS 전용 모델 목록을 동적으로 탐색합니다."""
     preferred = [
         "gemini-3.8-flash-preview-tts",
         "gemini-3.8-flash-tts",
-        "gemini-3.5-flash-preview-tts",
-        "gemini-3.0-flash-preview-tts",
         "gemini-2.5-flash-preview-tts",
-        "gemini-3.8-flash",
     ]
     discovered_tts: List[str] = []
     try:
         for m in client.models.list():
             name = (getattr(m, "name", "") or "").replace("models/", "")
             low = name.lower()
-            if "tts" in low or "audio" in low:
+            if "tts" in low:
                 discovered_tts.append(name)
         discovered_tts.sort(reverse=True)
-        logger.info(f"[Gemini TTS Models] 탐색된 오디오/TTS 모델 목록: {discovered_tts}")
+        logger.info(f"[Gemini TTS Models] 탐색된 TTS 모델 목록: {discovered_tts}")
     except Exception as e:
         logger.warning(f"[Gemini TTS Models] 모델 목록 조회 실패: {e}")
 
@@ -57,7 +50,7 @@ def discover_tts_models(client: Any) -> List[str]:
     for m in discovered_tts + preferred:
         if m not in ordered:
             ordered.append(m)
-    return ordered
+    return ordered[:4]
 
 
 def chunk_dialogue_for_gemini_tts(
@@ -89,6 +82,7 @@ def convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> bool:
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=30,
         )
         return mp3_path.exists() and mp3_path.stat().st_size > 1000
     except Exception as e:
@@ -109,7 +103,10 @@ async def generate_via_gemini_multi_speaker_tts(
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1beta"})
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"api_version": "v1beta", "timeout": 65000},
+    )
     q_name = HOST_PERSONAS["questioner"]["name"]
     e_name = HOST_PERSONAS["explainer"]["name"]
 
@@ -159,13 +156,14 @@ async def generate_via_gemini_multi_speaker_tts(
                 for attempt in range(2):
                     try:
                         logger.info(
-                            f"   -> [Gemini Multi-Speaker ({tts_model_name})] 청크 {c_idx+1}/{len(chunks)} 합성 중..."
+                            f"   -> [Gemini Multi-Speaker ({tts_model_name})] 청크 {c_idx+1}/{len(chunks)} 합성 중 (타임아웃 65초)..."
                         )
                         response = client.models.generate_content(
                             model=tts_model_name,
                             contents=prompt_text,
                             config=types.GenerateContentConfig(
                                 response_modalities=["AUDIO"],
+                                http_options=types.HttpOptions(timeout=65000),
                                 speech_config=types.SpeechConfig(
                                     multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
                                         speaker_voice_configs=[
@@ -200,15 +198,15 @@ async def generate_via_gemini_multi_speaker_tts(
                             break
                         if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                             if attempt == 0:
-                                logger.info("   -> [Gemini TTS] 분당 호출 제한(RPM) 대기 중 (22초 후 재시도)...")
-                                await asyncio.sleep(22)
+                                logger.info("   -> [Gemini TTS] 분당 호출 제한(RPM) 대기 중 (20초 후 재시도)...")
+                                await asyncio.sleep(20)
                                 continue
                             else:
-                                logger.warning(f"   -> [Gemini TTS] 무료 할당량(Quota) 도달. 남은 청크 보완: {e}")
+                                logger.warning(f"   -> [Gemini TTS] 무료 할당량(Quota) 도달. 남은 청크 고속 보완: {e}")
                                 quota_exhausted = True
                                 break
                         else:
-                            logger.warning(f"   -> [{tts_model_name}] 청크 {c_idx+1} 호출 오류: {e}")
+                            logger.warning(f"   -> [{tts_model_name}] 청크 {c_idx+1} 호출 오류/타임아웃: {e}")
                             break
                 if pcm_bytes or quota_exhausted:
                     break
@@ -224,10 +222,10 @@ async def generate_via_gemini_multi_speaker_tts(
                     chunk_mp3_files.append(chunk_mp3)
                     gemini_success_count += 1
                     if c_idx < len(chunks) - 1:
-                        await asyncio.sleep(6)
+                        await asyncio.sleep(5)
                     continue
             elif active_tts_model is None and c_idx == 0:
-                logger.warning("[Gemini TTS] 사용 가능한 멀티스피커 TTS 모델을 찾지 못해 Edge Neural TTS로 보완합니다.")
+                logger.warning("[Gemini TTS] 사용 가능한 멀티스피커 TTS 모델을 찾지 못해 고속 멀티보이스 합성으로 전환합니다.")
                 quota_exhausted = True
 
         ok_sub, _ = await synthesize_turns_with_edge_tts(chunk_turns, chunk_mp3)
@@ -262,18 +260,34 @@ async def synthesize_turns_with_edge_tts(
 
     seg_dir = OUTPUT_DIR / f"edge_segs_{int(time.time() * 1000)}"
     seg_dir.mkdir(parents=True, exist_ok=True)
-    seg_files: List[Path] = []
+    sem = asyncio.Semaphore(4)
+
+    async def _synth_one(idx: int, turn: Dict[str, Any]) -> Path | None:
+        speaker = turn.get("speaker", q_name)
+        text = turn.get("text", "").strip()
+        if not text:
+            return None
+        voice = q_voice if speaker == q_name else e_voice
+        seg_path = seg_dir / f"seg_{idx:04d}.mp3"
+        async with sem:
+            for attempt in range(2):
+                try:
+                    communicate = edge_tts.Communicate(text=text, voice=voice, rate="+3%")
+                    await asyncio.wait_for(communicate.save(str(seg_path)), timeout=25.0)
+                    if seg_path.exists() and seg_path.stat().st_size > 100:
+                        return seg_path
+                except Exception as e:
+                    if attempt == 1:
+                        logger.warning(f"[Edge TTS] 세그먼트 {idx} 합성 지연 건너뜀: {e}")
+                    await asyncio.sleep(1)
+        return None
+
     try:
-        for idx, turn in enumerate(turns):
-            speaker = turn.get("speaker", q_name)
-            text = turn.get("text", "").strip()
-            if not text:
-                continue
-            voice = q_voice if speaker == q_name else e_voice
-            seg_path = seg_dir / f"seg_{idx:04d}.mp3"
-            communicate = edge_tts.Communicate(text=text, voice=voice, rate="+3%")
-            await communicate.save(str(seg_path))
-            seg_files.append(seg_path)
+        results = await asyncio.gather(*[_synth_one(idx, t) for idx, t in enumerate(turns)])
+        seg_files = [p for p in results if p is not None]
+        if not seg_files:
+            shutil.rmtree(seg_dir, ignore_errors=True)
+            return False, "NO_SEGMENTS_GENERATED"
         with open(output_mp3_path, "wb") as outfile:
             for seg_path in seg_files:
                 outfile.write(seg_path.read_bytes())
