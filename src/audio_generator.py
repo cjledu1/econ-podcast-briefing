@@ -3,9 +3,11 @@ import base64
 import json
 import logging
 import shutil
+import subprocess
+import time
 import wave
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, List, Tuple
 
 from src.config import (
     AUDIO_DIR,
@@ -20,51 +22,48 @@ from src.config import (
 logger = logging.getLogger(__name__)
 
 
-def prepare_storage_state_file() -> Path | None:
-    """환경변수(GOOGLE_STORAGE_STATE_B64) 또는 로컬 경로에서 Playwright 세션 파일을 준비합니다."""
-    state_path = Path(GOOGLE_STORAGE_STATE_PATH)
+def cleanup_old_audio_files(keep_latest: int = 6) -> None:
+    try:
+        mp3_files = sorted(AUDIO_DIR.glob("briefing-*.mp3"), key=lambda p: p.name, reverse=True)
+        for old_file in mp3_files[keep_latest:]:
+            old_file.unlink(missing_ok=True)
+            logger.info(f"[Storage Cleanup] 오래된 오디오 파일 정리 완료: {old_file.name}")
+    except Exception as e:
+        logger.warning(f"[Storage Cleanup] 오디오 정리 중 오류 (무시): {e}")
 
+
+def prepare_storage_state_file() -> Path | None:
+    state_path = Path(GOOGLE_STORAGE_STATE_PATH)
     if GOOGLE_STORAGE_STATE_B64:
         try:
             decoded = base64.b64decode(GOOGLE_STORAGE_STATE_B64).decode("utf-8")
-            # 유효한 JSON인지 검증
             json.loads(decoded)
             temp_state = OUTPUT_DIR / "runtime_storage_state.json"
             temp_state.write_text(decoded, encoding="utf-8")
             return temp_state
         except Exception as e:
             logger.warning(f"GOOGLE_STORAGE_STATE_B64 디코딩 실패: {e}")
-
     if state_path.exists() and state_path.stat().st_size > 10:
         return state_path
-
     return None
 
 
 async def generate_via_notebooklm(
     briefing: Dict[str, Any], target_audio_path: Path
 ) -> Tuple[bool, str]:
-    """
-    Playwright를 사용해 Google NotebookLM에 소스를 업로드하고
-    맞춤형(Customize) 2인 한국어 팟캐스트 Audio Overview를 생성 및 다운로드합니다.
-    반환값: (성공 여부, 상태 메시지)
-    """
     state_file = prepare_storage_state_file()
     if not state_file:
-        return False, "NO_STORAGE_STATE: 구글 세션 쿠키(storage_state)가 설정되지 않았습니다."
+        return False, "NO_STORAGE_STATE"
 
     source_md_path = Path(briefing.get("notebook_source_path", ""))
     if not source_md_path.exists():
-        return False, "NO_SOURCE_MD: NotebookLM 업로드용 마크다운 파일이 없습니다."
-
-    source_text = source_md_path.read_text(encoding="utf-8")
+        return False, "NO_SOURCE_MD"
 
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        return False, "PLAYWRIGHT_NOT_INSTALLED: playwright 패키지가 설치되지 않았습니다."
+        return False, "PLAYWRIGHT_NOT_INSTALLED"
 
-    logger.info("[NotebookLM] Playwright 브라우저 시작 및 구글 세션 로드 중...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -78,364 +77,258 @@ async def generate_via_notebooklm(
             accept_downloads=True,
         )
         page = await context.new_page()
-
         try:
-            await page.goto(
-                "https://notebooklm.google.com/",
-                wait_until="domcontentloaded",
-                timeout=45000,
-            )
+            await page.goto("https://notebooklm.google.com/", wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(4000)
-
-            # 구글 로그인 페이지로 리다이렉트되었는지 확인
             if "accounts.google.com" in page.url:
-                logger.warning("[NotebookLM] 구글 로그인 세션이 만료되었습니다 (accounts.google.com 리다이렉트).")
                 await browser.close()
-                return False, "SESSION_EXPIRED: 구글 로그인 세션 쿠키가 만료되었습니다."
-
-            # 1. '새 노트북(New Notebook / 새로 만들기)' 버튼 클릭
-            logger.info("[NotebookLM] 새 노트북 생성 버튼 탐색 중...")
-            new_btn_selectors = [
-                "button:has-text('새 노트북')",
-                "button:has-text('새로 만들기')",
-                "button:has-text('New notebook')",
-                "button:has-text('Create')",
-                "mat-card.create-new-action-button",
-                "[aria-label*='새 노트북']",
-                "[aria-label*='New notebook']",
-            ]
-            clicked_new = False
-            for sel in new_btn_selectors:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click()
-                    clicked_new = True
-                    break
-
-            if not clicked_new:
-                return False, "UI_CHANGED: '새 노트북' 생성 버튼을 찾을 수 없습니다."
-
-            await page.wait_for_timeout(3000)
-
-            # 2. 소스 추가 모달에서 파일 업로드 또는 '복사된 텍스트(Copied text)' 입력
-            logger.info("[NotebookLM] 20대 뉴스 심층 해설 소스 업로드 중...")
-            file_input = page.locator("input[type='file']").first
-            if await file_input.count() > 0:
-                await file_input.set_input_files(str(source_md_path))
-                await page.wait_for_timeout(6000)
-            else:
-                # 텍스트 붙여넣기 옵션 클릭 시도
-                paste_selectors = [
-                    "button:has-text('복사된 텍스트')",
-                    "button:has-text('Copied text')",
-                    "mat-chip:has-text('복사된 텍스트')",
-                    "mat-chip:has-text('Copied text')",
-                ]
-                for sel in paste_selectors:
-                    loc = page.locator(sel).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await loc.click()
-                        await page.wait_for_timeout(1500)
-                        break
-
-                textarea = page.locator("textarea").first
-                if await textarea.count() > 0:
-                    await textarea.fill(source_text)
-                    insert_btn = page.locator(
-                        "button:has-text('삽입'), button:has-text('Insert')"
-                    ).first
-                    await insert_btn.click()
-                    await page.wait_for_timeout(6000)
-                else:
-                    return False, "SOURCE_UPLOAD_FAILED: 소스 입력란을 찾을 수 없습니다."
-
-            # 3. Audio Overview '맞춤설정(Customize)' 또는 '생성(Generate)' 실행
-            logger.info("[NotebookLM] Audio Overview 맞춤 프롬프트 입력 및 생성 요청 중...")
-            customize_selectors = [
-                "button:has-text('맞춤설정')",
-                "button:has-text('Customize')",
-                "[aria-label*='맞춤설정']",
-                "[aria-label*='Customize']",
-            ]
-            customized = False
-            for sel in customize_selectors:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click()
-                    await page.wait_for_timeout(1500)
-                    prompt_box = page.locator("textarea").last
-                    if await prompt_box.count() > 0:
-                        await prompt_box.fill(NOTEBOOKLM_CUSTOM_PROMPT)
-                        customized = True
-                    break
-
-            gen_selectors = [
-                "button:has-text('생성')",
-                "button:has-text('Generate')",
-                "[aria-label*='오디오 개요 생성']",
-                "[aria-label*='Generate Audio Overview']",
-            ]
-            clicked_gen = False
-            for sel in gen_selectors:
-                loc = page.locator(sel).last
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click()
-                    clicked_gen = True
-                    break
-
-            if not clicked_gen:
-                return False, "AUDIO_GEN_BTN_NOT_FOUND: Audio Overview 생성 버튼을 찾을 수 없습니다."
-
-            # 4. 오디오 생성 완료 대기 (최대 10분 폴링)
-            logger.info(
-                f"[NotebookLM] 오디오 생성 시작됨 (맞춤 프롬프트 적용={customized}). 완료까지 대기합니다..."
-            )
-            for elapsed_sec in range(0, 600, 10):
-                await page.wait_for_timeout(10000)
-
-                # 다운로드 메뉴 또는 오디오 플레이어 등장 확인
-                more_menu = page.locator(
-                    "button[aria-label*='더보기'], button[aria-label*='More'], button:has(mat-icon:has-text('more_vert'))"
-                ).last
-                download_btn = page.locator(
-                    "a[download], button:has-text('다운로드'), button:has-text('Download'), [ role='menuitem' ]:has-text('다운로드'), [ role='menuitem' ]:has-text('Download')"
-                ).first
-
-                if await download_btn.count() > 0 and await download_btn.is_visible():
-                    async with page.expect_download(timeout=60000) as download_info:
-                        await download_btn.click()
-                    download = await download_info.value
-                    await download.save_as(str(target_audio_path))
-                    logger.info(f"[NotebookLM] 오디오 다운로드 성공: {target_audio_path}")
-                    await browser.close()
-                    return True, "NOTEBOOKLM_SUCCESS"
-
-                if elapsed_sec >= 60 and await more_menu.count() > 0 and await more_menu.is_visible():
-                    try:
-                        await more_menu.click()
-                        await page.wait_for_timeout(1000)
-                        dl_item = page.locator(
-                            "[role='menuitem']:has-text('다운로드'), [role='menuitem']:has-text('Download')"
-                        ).first
-                        if await dl_item.count() > 0 and await dl_item.is_visible():
-                            async with page.expect_download(timeout=60000) as download_info:
-                                await dl_item.click()
-                            download = await download_info.value
-                            await download.save_as(str(target_audio_path))
-                            logger.info(f"[NotebookLM] 오디오 다운로드 성공: {target_audio_path}")
-                            await browser.close()
-                            return True, "NOTEBOOKLM_SUCCESS"
-                    except Exception:
-                        pass
-
+                return False, "SESSION_EXPIRED"
             await browser.close()
-            return False, "TIMEOUT: NotebookLM 오디오 생성 시간이 10분을 초과했습니다."
-
+            return False, "SKIPPED_TO_GEMINI_AUDIO"
         except Exception as e:
-            logger.warning(f"[NotebookLM] 웹 자동화 중 예외 발생: {e}")
             await browser.close()
             return False, f"EXCEPTION: {e}"
 
 
-async def generate_via_edge_tts(
+def chunk_dialogue_for_gemini_tts(
+    dialogue: List[Dict[str, Any]], max_chars_per_chunk: int = 1900
+) -> List[List[Dict[str, Any]]]:
+    chunks: List[List[Dict[str, Any]]] = []
+    current_chunk: List[Dict[str, Any]] = []
+    current_len = 0
+    for turn in dialogue:
+        text = turn.get("text", "").strip()
+        if not text:
+            continue
+        if current_chunk and (current_len + len(text) > max_chars_per_chunk):
+            chunks.append(current_chunk)
+            current_chunk = [turn]
+            current_len = len(text)
+        else:
+            current_chunk.append(turn)
+            current_len += len(text)
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> bool:
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", "128k", str(mp3_path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return mp3_path.exists() and mp3_path.stat().st_size > 1000
+    except Exception as e:
+        logger.warning(f"[ffmpeg] WAV -> MP3 변환 실패: {e}")
+        return False
+
+
+async def generate_via_gemini_multi_speaker_tts(
     briefing: Dict[str, Any], target_audio_path: Path
 ) -> Tuple[bool, str]:
-    """
-    2순위 Fallback 엔진: Microsoft Edge Neural 한국어 다중 화자(SunHi & InJoon)를 이용해
-    지민(질문자)과 현우(해설자)의 2인 문답 대본을 하나의 자연스러운 MP3 파일로 합성합니다.
-    """
-    import edge_tts
+    if not GEMINI_API_KEY:
+        return False, "NO_GEMINI_KEY"
 
     dialogue = briefing.get("dialogue", [])
     if not dialogue:
-        return False, "대본(dialogue) 데이터가 비어 있습니다."
+        return False, "EMPTY_DIALOGUE"
+
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    q_name = HOST_PERSONAS["questioner"]["name"]
+    e_name = HOST_PERSONAS["explainer"]["name"]
+
+    chunks = chunk_dialogue_for_gemini_tts(dialogue, max_chars_per_chunk=1900)
+    logger.info(
+        f"[Gemini 2.5 Multi-Speaker TTS] 총 {len(dialogue)}턴 대본을 {len(chunks)}개 멀티보이스 청크로 합성합니다..."
+    )
+
+    temp_dir = OUTPUT_DIR / "gemini_tts_chunks"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_mp3_files: List[Path] = []
+    gemini_success_count = 0
+    quota_exhausted = False
+
+    for c_idx, chunk_turns in enumerate(chunks):
+        chunk_mp3 = temp_dir / f"chunk_{c_idx:03d}.mp3"
+        chunk_wav = temp_dir / f"chunk_{c_idx:03d}.wav"
+
+        if not quota_exhausted:
+            script_lines = [f"{t.get('speaker', q_name)}: {t.get('text', '')}" for t in chunk_turns]
+            prompt_text = (
+                f"# AUDIO PROFILE: {q_name} & {e_name}의 모닝 경제 토크\n"
+                f"## THE SCENE\n"
+                f"서울의 아늑한 팟캐스트 스튜디오. 친한 직장 선후배 사이인 호기심 많은 후배 '{q_name}'과 "
+                f"비유를 잘하는 다정한 선배 '{e_name}'가 아침 커피를 마시며 대본 없이 편안하게 수다를 떨고 있습니다.\n\n"
+                f"### DIRECTOR'S NOTES\n"
+                f"- **Style & Tone**: 절대 뉴스 아나운서나 기계처럼 딱딱하게 글자를 읽지 마세요(No newsreader or robotic tone). "
+                f"구글 NotebookLM 오디오 개요처럼 진짜 사람 두 명이 대화하듯 감정을 듬뿍 담아 자연스러운 일상 서울 말투(초구어체)로 연기하세요.\n"
+                f"- **Breathing & Reactions**: 대사 속의 '어?', '아...', '음...', '하하', '그니까요!' 같은 추임새에서 실제로 살짝 웃거나 숨을 고르며(natural micro-pauses) 생동감 있게 리액션하세요.\n"
+                f"- **Pacing**: 일상 대화처럼 완급을 조절하세요. 맞장구를 칠 때는 경쾌하고 빠르게, 중요한 경제 비유를 풀어줄 때는 친절하고 또렷하게 말하세요.\n\n"
+                f"#### TRANSCRIPT\n"
+                + "\n".join(script_lines)
+            )
+
+            pcm_bytes = None
+            for attempt in range(2):
+                try:
+                    logger.info(f"   -> [Gemini 2.5 Multi-Speaker] 청크 {c_idx+1}/{len(chunks)} 합성 중...")
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash-preview-tts",
+                        contents=prompt_text,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(
+                                multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
+                                    speaker_voice_configs=[
+                                        types.SpeakerVoiceConfig(
+                                            speaker=q_name,
+                                            voice_config=types.VoiceConfig(
+                                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                                    voice_name="Aoede"
+                                                )
+                                            ),
+                                        ),
+                                        types.SpeakerVoiceConfig(
+                                            speaker=e_name,
+                                            voice_config=types.VoiceConfig(
+                                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                                    voice_name="Puck"
+                                                )
+                                            ),
+                                        ),
+                                    ]
+                                )
+                            ),
+                        ),
+                    )
+                    pcm_bytes = response.candidates[0].content.parts[0].inline_data.data
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        if attempt == 0:
+                            logger.info("   -> [Gemini TTS] 분당 호출 제한(RPM) 대기 중 (22초 후 재시도)...")
+                            await asyncio.sleep(22)
+                            continue
+                        else:
+                            logger.warning(f"   -> [Gemini TTS] 무료 할당량(Quota) 도달. 남은 청크 보완: {e}")
+                            quota_exhausted = True
+                            break
+                    else:
+                        logger.warning(f"   -> [Gemini TTS] 청크 {c_idx+1} 호출 오류: {e}")
+                        break
+
+            if pcm_bytes:
+                with wave.open(str(chunk_wav), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    wf.writeframes(pcm_bytes)
+
+                if convert_wav_to_mp3(chunk_wav, chunk_mp3):
+                    chunk_mp3_files.append(chunk_mp3)
+                    gemini_success_count += 1
+                    if c_idx < len(chunks) - 1:
+                        await asyncio.sleep(6)
+                    continue
+
+        ok_sub, _ = await synthesize_turns_with_edge_tts(chunk_turns, chunk_mp3)
+        if ok_sub and chunk_mp3.exists():
+            chunk_mp3_files.append(chunk_mp3)
+
+    if not chunk_mp3_files:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False, "ALL_GEMINI_CHUNKS_FAILED"
+
+    with open(target_audio_path, "wb") as outfile:
+        for mp3_file in chunk_mp3_files:
+            outfile.write(mp3_file.read_bytes())
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    engine_label = (
+        "GEMINI_2.5_NATIVE_MULTI_SPEAKER_AUDIO"
+        if gemini_success_count > 0
+        else "FALLBACK_MULTI_VOICE_TTS"
+    )
+    return True, engine_label
+
+
+async def synthesize_turns_with_edge_tts(
+    turns: List[Dict[str, Any]], output_mp3_path: Path
+) -> Tuple[bool, str]:
+    import edge_tts
 
     q_name = HOST_PERSONAS["questioner"]["name"]
     q_voice = HOST_PERSONAS["questioner"]["voice_edge"]
     e_voice = HOST_PERSONAS["explainer"]["voice_edge"]
 
-    temp_dir = OUTPUT_DIR / "tts_segments"
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(
-        f"[Fallback TTS] 2인 팟캐스트 음성 합성 시작 (총 {len(dialogue)}턴, 진행자: {q_name} & {HOST_PERSONAS['explainer']['name']})..."
-    )
-
-    segment_files = []
+    seg_dir = OUTPUT_DIR / f"edge_segs_{int(time.time() * 1000)}"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    seg_files: List[Path] = []
     try:
-        for idx, turn in enumerate(dialogue):
+        for idx, turn in enumerate(turns):
             speaker = turn.get("speaker", q_name)
             text = turn.get("text", "").strip()
             if not text:
                 continue
-
             voice = q_voice if speaker == q_name else e_voice
-            rate = "+6%" if speaker == q_name else "+4%"
-            seg_path = temp_dir / f"seg_{idx:04d}.mp3"
-
-            communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
+            seg_path = seg_dir / f"seg_{idx:04d}.mp3"
+            communicate = edge_tts.Communicate(text=text, voice=voice, rate="+3%")
             await communicate.save(str(seg_path))
-            segment_files.append(seg_path)
-
-        # MP3 세그먼트 스트림 병합
-        with open(target_audio_path, "wb") as outfile:
-            for seg_path in segment_files:
+            seg_files.append(seg_path)
+        with open(output_mp3_path, "wb") as outfile:
+            for seg_path in seg_files:
                 outfile.write(seg_path.read_bytes())
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        size_kb = target_audio_path.stat().st_size // 1024
-        logger.info(f"[Fallback TTS] 2인 팟캐스트 MP3 생성 완료: {target_audio_path} ({size_kb} KB)")
+        shutil.rmtree(seg_dir, ignore_errors=True)
         return True, "FALLBACK_MULTI_VOICE_TTS"
     except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.warning(f"[Edge TTS] 네트워크/인증서 제약으로 호출 실패: {e}")
-        return False, str(e)
-
-
-def generate_offline_demo_audio(target_audio_path: Path) -> Tuple[bool, str]:
-    """API 키 미설정 로컬 테스트 시 오디오 파일 누락을 방지하기 위한 샘플 오디오 파일 생성."""
-    import math
-    import struct
-
-    sample_rate = 24000
-    duration_sec = 3
-    n_samples = sample_rate * duration_sec
-    with wave.open(str(target_audio_path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        frames = bytearray()
-        for i in range(n_samples):
-            t = i / sample_rate
-            freq = 440.0 if t < 0.4 else (554.37 if t < 0.8 else 659.25)
-            env = max(0.0, 1.0 - (t / duration_sec))
-            val = int(4000 * env * math.sin(2 * math.pi * freq * t))
-            frames.extend(struct.pack("<h", val))
-        wf.writeframes(bytes(frames))
-    return True, "BROWSER_WEB_SPEECH_TTS_READY"
-
-
-def generate_via_gemini_multi_speaker_tts(
-    briefing: Dict[str, Any], target_audio_path: Path
-) -> Tuple[bool, str]:
-    """
-    Gemini 2.5 Native Multi-Speaker TTS를 사용하여 2인 대화 오디오를 생성합니다.
-    """
-    if not GEMINI_API_KEY:
-        return False, "NO_GEMINI_KEY"
-
-    try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        q_name = HOST_PERSONAS["questioner"]["name"]
-        e_name = HOST_PERSONAS["explainer"]["name"]
-
-        script_lines = [
-            f"{turn.get('speaker', q_name)}: {turn.get('text', '')}"
-            for turn in briefing.get("dialogue", [])
-        ]
-        full_transcript = (
-            f"다음은 경제 입문자 '{q_name}'과 친절한 경제 멘토 '{e_name}'의 모닝 경제/경영 팟캐스트 대화입니다. "
-            f"두 사람의 개성과 억양을 살려 자연스러운 한국어 팟캐스트 톤으로 읽어주세요.\n\n"
-            + "\n".join(script_lines)
-        )
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
-            contents=full_transcript,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
-                        speaker_voice_configs=[
-                            types.SpeakerVoiceConfig(
-                                speaker=q_name,
-                                voice_config=types.VoiceConfig(
-                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                        voice_name=HOST_PERSONAS["questioner"]["voice_gemini"]
-                                    )
-                                ),
-                            ),
-                            types.SpeakerVoiceConfig(
-                                speaker=e_name,
-                                voice_config=types.VoiceConfig(
-                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                        voice_name=HOST_PERSONAS["explainer"]["voice_gemini"]
-                                    )
-                                ),
-                            ),
-                        ]
-                    )
-                ),
-            ),
-        )
-
-        pcm_data = response.candidates[0].content.parts[0].inline_data.data
-        wav_path = target_audio_path.with_suffix(".wav")
-        with wave.open(str(wav_path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(pcm_data)
-
-        if wav_path != target_audio_path:
-            shutil.move(str(wav_path), str(target_audio_path))
-        return True, "GEMINI_NATIVE_MULTI_SPEAKER_TTS"
-    except Exception as e:
-        logger.warning(f"[Gemini TTS] 호출 실패 (Edge Neural TTS로 자동 전환합니다): {e}")
+        shutil.rmtree(seg_dir, ignore_errors=True)
         return False, str(e)
 
 
 async def produce_podcast_audio(
     briefing: Dict[str, Any], force_fallback: bool = False
 ) -> Dict[str, Any]:
-    """
-    하이브리드 오디오 파이프라인:
-    1순위: NotebookLM Playwright 웹 자동화 시도
-    2순위: 실패 또는 세션 만료 시 멀티 화자 TTS(Gemini / Edge Neural)로 즉시 자동 전환하여 브리핑 누락 방지
-    """
     date_str = briefing.get("date", "latest")
     audio_filename = f"briefing-{date_str}.mp3"
     target_audio_path = AUDIO_DIR / audio_filename
 
     notebooklm_status = "SKIPPED"
-    engine_used = "FALLBACK_TTS"
+    engine_used = "GEMINI_2.5_NATIVE_MULTI_SPEAKER_AUDIO"
     session_expired = False
 
     if not force_fallback:
         ok, status_msg = await generate_via_notebooklm(briefing, target_audio_path)
         notebooklm_status = status_msg
         if ok and target_audio_path.exists():
-            engine_used = "NOTEBOOKLM_AUDIO_OVERVIEW"
+            cleanup_old_audio_files(keep_latest=6)
             return {
                 "audio_filename": audio_filename,
                 "audio_path": str(target_audio_path),
-                "engine_used": engine_used,
+                "engine_used": "NOTEBOOKLM_AUDIO_OVERVIEW",
                 "notebooklm_status": notebooklm_status,
                 "session_expired": False,
             }
         if "SESSION_EXPIRED" in status_msg:
             session_expired = True
-        logger.info(
-            f"[Hybrid Audio] NotebookLM 미사용/실패 사유({status_msg}) -> 2인 멀티 화자 TTS 엔진으로 자동 전환합니다."
-        )
 
-    # 2순위 Fallback: Gemini Multi-Speaker TTS -> Edge Neural TTS -> 로컬 데모 오디오 순으로 시도
-    ok_gem, gem_msg = generate_via_gemini_multi_speaker_tts(briefing, target_audio_path)
-    if ok_gem:
+    ok_gem, gem_msg = await generate_via_gemini_multi_speaker_tts(briefing, target_audio_path)
+    if ok_gem and target_audio_path.exists():
         engine_used = gem_msg
     else:
-        ok_edge, tts_msg = await generate_via_edge_tts(briefing, target_audio_path)
-        if ok_edge:
-            engine_used = tts_msg
-        else:
-            _, demo_msg = generate_offline_demo_audio(target_audio_path)
-            engine_used = demo_msg
+        _, tts_msg = await synthesize_turns_with_edge_tts(briefing.get("dialogue", []), target_audio_path)
+        engine_used = tts_msg
 
+    cleanup_old_audio_files(keep_latest=6)
     return {
         "audio_filename": audio_filename,
         "audio_path": str(target_audio_path),
