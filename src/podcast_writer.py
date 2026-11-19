@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def clean_json_response(raw_text: str) -> str:
-    text = raw_text.strip()
+    text = (raw_text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
@@ -56,15 +56,21 @@ def discover_text_models(client: Any) -> List[str]:
 
 
 def build_curation_prompt(articles: List[Dict[str, Any]], date_str: str, weekday_ko: str) -> str:
-    q_host = HOST_PERSONAS["questioner"]
-    e_host = HOST_PERSONAS["explainer"]
+    q_host = HOST_PERSONAS.get("questioner", {})
+    e_host = HOST_PERSONAS.get("explainer", {})
+    q_name = q_host.get("name", "지민")
+    e_name = e_host.get("name", "현우")
+    q_role = q_host.get("role", "경제 입문자")
+    e_role = e_host.get("role", "친절한 경제 멘토")
+    q_desc = q_host.get("description", q_host.get("style", "호기심 많은 직장인 후배"))
+    e_desc = e_host.get("description", e_host.get("style", "일상 비유로 쉽게 풀어주는 다정한 선배"))
 
     articles_text = "\n".join(
         [
-            f"[{idx+1}] ({a['category']} | {a['source']}) 제목: {a['title']}\n"
-            f"    링크: {a['url']}\n"
-            f"    요약: {a['summary']}"
-            for idx, a in enumerate(articles[:80])
+            f"[{idx+1}] ({a.get('category', '경제')} | {a.get('source', '언론사')}) 제목: {a.get('title', '')}\n"
+            f"    링크: {a.get('url', '')}\n"
+            f"    요약: {a.get('summary', '')}"
+            for idx, a in enumerate(articles[:75])
         ]
     )
 
@@ -76,19 +82,19 @@ def build_curation_prompt(articles: List[Dict[str, Any]], date_str: str, weekday
 가장 중요하고 학습 가치가 높은 **정확히 20개의 뉴스**를 엄선하여 JSON 형식으로 작성해 주세요.
 
 [호스트 페르소나]
-- 질문자 **{q_host['name']}** ({q_host['role']}): {q_host['style']}
-- 해설자 **{e_host['name']}** ({e_host['role']}): {e_host['style']}
+- 질문자 **{q_name}** ({q_role}): {q_desc}
+- 해설자 **{e_name}** ({e_role}): {e_desc}
 
 [초구어체(NotebookLM 스타일) 대사 작성 절대 규칙 — 기계음/낭독투 절대 금지!]
 1. **문어체 완전 금지**: "~입니다", "~했습니다", "~에 대해 알아보겠습니다" 같은 딱딱한 뉴스 낭독투를 절대 쓰지 마세요.
 2. **진짜 사람의 입말과 추임새(Backchanneling)**:
    - 모든 질문과 답변 대사에 실제 사람이 대화할 때 쓰는 추임새("어? 선배님,", "잠깐만요, 그러니까...", "헐, 진짜요?", "아~ 이제 감이 딱 오네요!", "하하, 맞아요 지민님!", "음... 쉽게 비유하자면요,", "그니까 제가 하고 싶은 말이 바로 그거예요!")를 자연스럽게 넣으세요.
    - 사람이 숨을 쉬며 말하듯 쉼표(,)와 말줄임표(...)로 호흡을 자연스럽게 끊어주세요.
-3. **각 뉴스마다 4턴 티키타카 대화(`q1`, `a1`, `q2`, `a2`) 작성**:
-   - `question`(`q1`): {q_host['name']}가 뉴스 팩트를 언급하며 초보자 눈높이에서 솔직하고 호기심 넘치게 던지는 첫 질문 (구어체 2~3문장)
-   - `answer`(`a1`): {e_host['name']}가 찰떡같은 일상 비유를 들어 친절하게 풀어주는 첫 번째 답변 (구어체 3~4문장)
-   - `followup_question`(`q2`): {q_host['name']}가 비유에 맞장구치며 "그럼 이게 당장 우리 직장인 지갑이나 회사 경영에는 어떤 영향을 주는 거예요?"라고 한 단계 더 파고드는 꼬리 질문 (구어체 1~2문장)
-   - `economic_meaning`(`a2`): {e_host['name']}가 개인 재테크와 기업 경영에 미치는 나비효과와 핵심 포인트를 짚어주는 두 번째 답변 (구어체 3~4문장)
+3. **각 뉴스마다 4턴 티키타카 대화(`question`, `answer`, `followup_question`, `economic_meaning`) 작성**:
+   - `question`: {q_name}가 뉴스 팩트를 언급하며 초보자 눈높이에서 솔직하고 호기심 넘치게 던지는 첫 질문 (구어체 2문장)
+   - `answer`: {e_name}가 찰떡같은 일상 비유를 들어 친절하게 풀어주는 첫 번째 답변 (구어체 2~3문장)
+   - `followup_question`: {q_name}가 비유에 맞장구치며 "그럼 이게 당장 우리 직장인 지갑이나 회사 경영에는 어떤 영향을 주는 거예요?"라고 한 단계 더 파고드는 꼬리 질문 (구어체 1~2문장)
+   - `economic_meaning`: {e_name}가 개인 재테크와 기업 경영에 미치는 나비효과와 핵심 포인트를 짚어주는 두 번째 답변 (구어체 2~3문장)
    - ※ 주의: 20개 뉴스마다 `followup_question`과 맞장구 표현을 똑같이 반복하지 말고, 각 뉴스 내용에 맞게 매번 다르게 생동감 있게 변주하세요!
 
 [출력 JSON 스키마 (반드시 유효한 JSON 객체만 출력)]
@@ -96,16 +102,16 @@ def build_curation_prompt(articles: List[Dict[str, Any]], date_str: str, weekday
   "episode_title": "오늘의 팟캐스트 에피소드 제목",
   "executive_summary": "오늘의 핵심 흐름 3줄 요약 (줄바꿈 포함)",
   "opening_banter": [
-    {{"speaker": "{q_host['name']}", "text": "{weekday_ko}요일 아침 출근길 생동감 넘치는 오프닝 인사와 오늘 경제 뉴스에 대한 호기심 (구어체 3문장)"}},
-    {{"speaker": "{e_host['name']}", "text": "반갑게 맞장구치며 오늘 다룰 4가지 핵심 테마를 커피 한 잔 마시듯 쉽게 풀어주겠다는 다정한 인사 (구어체 3문장)"}}
+    {{"speaker": "{q_name}", "text": "{weekday_ko}요일 아침 출근길 생동감 넘치는 오프닝 인사와 오늘 경제 뉴스에 대한 호기심 (구어체 2~3문장)"}},
+    {{"speaker": "{e_name}", "text": "반갑게 맞장구치며 오늘 다룰 4가지 핵심 테마를 커피 한 잔 마시듯 쉽게 풀어주겠다는 다정한 인사 (구어체 2~3문장)"}}
   ],
   "themes": [
     {{
       "id": "theme_1",
       "title": "1. 테마 제목",
       "summary": "핵심 맥락 2문장 요약",
-      "intro_q": "{q_host['name']}가 이 테마를 시작하며 던지는 자연스러운 화제 전환 질문 (구어체)",
-      "intro_a": "{e_host['name']}가 이 테마의 큰 그림을 쉽게 짚어주는 도입 답변 (구어체)"
+      "intro_q": "{q_name}가 이 테마를 시작하며 던지는 자연스러운 화제 전환 질문 (구어체)",
+      "intro_a": "{e_name}가 이 테마의 큰 그림을 쉽게 짚어주는 도입 답변 (구어체)"
     }},
     {{
       "id": "theme_2",
@@ -138,19 +144,19 @@ def build_curation_prompt(articles: List[Dict[str, Any]], date_str: str, weekday
       "title": "뉴스 제목 (한국어)",
       "source": "언론사명",
       "url": "원문 링크",
-      "fact_summary": "핵심 팩트 요약 (2~3문장)",
+      "summary": "핵심 팩트 요약 (2문장)",
       "beginner_qna": {{
-        "question": "지민의 첫 번째 호기심 질문 (초구어체 2~3문장)",
-        "answer": "현우의 일상 비유 해설 답변 (초구어체 3~4문장)",
+        "question": "지민의 첫 번째 호기심 질문 (초구어체 2문장)",
+        "answer": "현우의 일상 비유 해설 답변 (초구어체 2~3문장)",
         "followup_question": "지민의 맞장구 및 심화 꼬리 질문 (초구어체 1~2문장)"
       }},
-      "economic_meaning": "현우의 꼬리 질문 답변 및 개인/기업 파급효과 해설 (초구어체 3~4문장)",
+      "economic_meaning": "현우의 꼬리 질문 답변 및 개인/기업 파급효과 해설 (초구어체 2~3문장)",
       "key_terms": ["핵심용어1", "핵심용어2"]
     }}
   ],
   "closing_banter": [
-    {{"speaker": "{q_host['name']}", "text": "오늘 20개 뉴스를 들으며 느낀 소감과 청취자 인사 (구어체 2~3문장)"}},
-    {{"speaker": "{e_host['name']}", "text": "오늘의 핵심 한 줄 정리와 따뜻한 출근길 응원 마무리 인사 (구어체 2~3문장)"}}
+    {{"speaker": "{q_name}", "text": "오늘 20개 뉴스를 들으며 느낀 소감과 청취자 인사 (구어체 2문장)"}},
+    {{"speaker": "{e_name}", "text": "오늘의 핵심 한 줄 정리와 따뜻한 출근길 응원 마무리 인사 (구어체 2문장)"}}
   ],
   "glossary": [
     {{
@@ -170,8 +176,8 @@ def assemble_colloquial_dialogue(
     briefing: Dict[str, Any], weekday_ko: str
 ) -> List[Dict[str, Any]]:
     """Gemini가 생성한 오프닝, 4대 테마 도입부, 20개 뉴스별 4턴 티키타카, 클로징을 92턴 대화로 조립합니다."""
-    q_name = HOST_PERSONAS["questioner"]["name"]
-    e_name = HOST_PERSONAS["explainer"]["name"]
+    q_name = HOST_PERSONAS.get("questioner", {}).get("name", "지민")
+    e_name = HOST_PERSONAS.get("explainer", {}).get("name", "현우")
     dialogue: List[Dict[str, Any]] = []
 
     opening = briefing.get("opening_banter", [])
@@ -199,6 +205,12 @@ def assemble_colloquial_dialogue(
     themes = briefing.get("themes", [])
     news_items = briefing.get("news_items", [])
 
+    # news_items의 summary / fact_summary 필드 양방향 보정 (웹 플레이어 호환성)
+    for item in news_items:
+        summary_val = item.get("summary") or item.get("fact_summary") or ""
+        item["summary"] = summary_val
+        item["fact_summary"] = summary_val
+
     for idx, theme in enumerate(themes):
         tid = theme.get("id", f"theme_{idx+1}")
         intro_q = theme.get("intro_q") or f"좋아요! 그럼 바로 '{theme.get('title')}' 이야기부터 들어가 볼까요? 선배님, 이번 파트에서 우리가 제일 주목해야 할 흐름이 뭔가요?"
@@ -212,9 +224,9 @@ def assemble_colloquial_dialogue(
             theme_news = news_items[idx * 5 : (idx + 1) * 5]
 
         for n in theme_news:
-            qna = n.get("beginner_qna", {})
-            q1 = qna.get("question") or f"어, 선배님! '{n.get('title')}'라는 소식이 있거든요? {n.get('fact_summary')} 이게 도대체 무슨 뜻이고 왜 중요한 건가요?"
-            a1 = qna.get("answer") or n.get("fact_summary", "")
+            qna = n.get("beginner_qna", {}) or {}
+            q1 = qna.get("question") or f"어, 선배님! '{n.get('title')}'라는 소식이 있거든요? {n.get('summary')} 이게 도대체 무슨 뜻이고 왜 중요한 건가요?"
+            a1 = qna.get("answer") or n.get("summary", "")
             q2 = qna.get("followup_question") or "아~ 그렇게 비유해 주시니까 단번에 이해가 되네요! 근데 선배님, 그러면 이게 실제로 우리 지갑이나 회사 경영에는 어떤 영향을 주는 건가요?"
             a2 = n.get("economic_meaning") or "바로 그 뒷배경을 읽는 게 핵심이에요!"
 
@@ -250,6 +262,53 @@ def assemble_colloquial_dialogue(
     return dialogue
 
 
+def build_emergency_briefing_from_articles(
+    articles: List[Dict[str, Any]], date_str: str, weekday_ko: str
+) -> Dict[str, Any]:
+    """모든 외부 LLM API가 일시 장애일 때에도 파이프라인이 중단되지 않도록 수집된 실시간 뉴스 20개로 초구어체 브리핑을 구성합니다."""
+    selected = articles[:20]
+    themes = [
+        {"id": "theme_1", "title": "1. 국내 경제와 주요 기업 경영 이슈", "summary": "국내 주요 산업과 기업들의 최신 경영 전략과 시장 변화를 짚어봅니다."},
+        {"id": "theme_2", "title": "2. 글로벌 거시경제와 빅테크 흐름", "summary": "미국 증시와 글로벌 빅테크, 통상 환경의 변화를 쉽게 풀어봅니다."},
+        {"id": "theme_3", "title": "3. 금리·환율·금융시장 핵심 시그널", "summary": "금리와 환율, 금융시장의 움직임이 우리 지갑에 미치는 영향을 알아봅니다."},
+        {"id": "theme_4", "title": "4. 부동산과 생활 밀착형 재테크", "summary": "부동산 시장과 가계 자산 관리에 직결되는 핵심 소식을 정리합니다."},
+    ]
+    news_items: List[Dict[str, Any]] = []
+    for idx, art in enumerate(selected):
+        tid = f"theme_{(idx // 5) + 1}"
+        title = art.get("title", f"주요 경제 뉴스 {idx+1}")
+        summary = art.get("summary") or f"{title}에 관한 최신 경제·경영 소식입니다."
+        news_items.append({
+            "id": idx + 1,
+            "theme_id": tid,
+            "is_deep_dive": (idx % 3 == 0),
+            "category": art.get("category", "국내 경제/기업"),
+            "title": title,
+            "source": art.get("source", "경제 뉴스"),
+            "url": art.get("url", ""),
+            "summary": summary,
+            "fact_summary": summary,
+            "beginner_qna": {
+                "question": f"어? 선배님, '{title}'라는 기사가 눈에 띄는데요, 이게 구체적으로 어떤 내용이고 왜 지금 화제가 되는 건가요?",
+                "answer": f"하하, 지민님 핵심을 잘 짚으셨어요! 쉽게 말해서 {summary} 시장의 돈과 기업의 투자가 어디로 움직이는지 보여주는 중요한 신호탄이라고 보면 돼요.",
+                "followup_question": "아~ 그런 맥락이 있었군요! 그러면 이게 당장 우리 같은 직장인이나 회사 경영에는 어떤 영향을 주게 될까요?",
+            },
+            "economic_meaning": "이런 변화가 생기면 기업들은 투자 우선순위를 조정하게 되고, 우리 개인 입장에서도 소비나 재테크 방향을 잡을 때 꼭 참고해야 할 이정표가 됩니다.",
+            "key_terms": [art.get("category", "거시경제"), "시장 시그널"],
+        })
+
+    return {
+        "episode_title": f"[{date_str} {weekday_ko}요일] 출근길 핵심 경제·경영 브리핑 20선",
+        "executive_summary": "1) 국내외 주요 산업 및 기업 경영 환경의 핵심 변화 점검\n2) 글로벌 거시경제와 금융·환율 시장의 나비효과 해설\n3) 직장인과 입문자가 꼭 알아야 할 부동산·재테크 실전 포인트",
+        "themes": themes,
+        "news_items": news_items,
+        "glossary": [
+            {"term": "기준금리", "simple_def": "중앙은행이 시중 은행과 거래할 때 기준이 되는 금리", "analogy": "경제 전체의 돈의 온도를 조절하는 보일러 온도 조절기"},
+            {"term": "환율", "simple_def": "외국 돈과 우리 돈의 교환 비율", "analogy": "해외 직구나 수출을 할 때 적용되는 달러의 가격표"},
+        ],
+    }
+
+
 def compile_notebooklm_markdown(briefing: Dict[str, Any], date_str: str, weekday_ko: str) -> str:
     lines = [
         f"# [{date_str} ({weekday_ko}) 아침 7:30] 경제·경영 모닝 팟캐스트 브리핑 20선",
@@ -265,12 +324,12 @@ def compile_notebooklm_markdown(briefing: Dict[str, Any], date_str: str, weekday
     lines.append("## 3. 오늘의 주요 경제·경영 뉴스 20선 (초보자 눈높이 Q&A 해설)")
 
     for item in briefing.get("news_items", []):
-        qna = item.get("beginner_qna", {})
+        qna = item.get("beginner_qna", {}) or {}
         deep_badge = "🔥 [핵심 딥다이브]" if item.get("is_deep_dive") else "[주요 뉴스]"
         lines.extend(
             [
                 f"### 뉴스 #{item.get('id')}. {deep_badge} [{item.get('category')}] {item.get('title')} ({item.get('source')})",
-                f"- **핵심 팩트**: {item.get('fact_summary')}",
+                f"- **핵심 팩트**: {item.get('summary') or item.get('fact_summary')}",
                 f"- **초보자 질문 (Q)**: {qna.get('question')}",
                 f"- **쉬운 비유 해설 (A)**: {qna.get('answer')}",
                 f"- **경제/경영 파급효과**: {item.get('economic_meaning')}",
@@ -286,6 +345,44 @@ def compile_notebooklm_markdown(briefing: Dict[str, Any], date_str: str, weekday
     return "\n".join(lines)
 
 
+def _call_gemini_curation(
+    client: Any,
+    model_name: str,
+    prompt: str,
+) -> Dict[str, Any]:
+    """Thinking 지연을 먼저 0으로 시도(약 80~90초 완료)하고, 미지원 모델이면 기본 모드로 호출합니다."""
+    from google.genai import types
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=16384,
+                temperature=0.5,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                http_options=types.HttpOptions(timeout=270000),
+            ),
+        )
+    except Exception as first_err:
+        err_msg = str(first_err).lower()
+        if "thinking" in err_msg or "invalid_argument" in err_msg or "400" in err_msg:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=16384,
+                    temperature=0.5,
+                    http_options=types.HttpOptions(timeout=300000),
+                ),
+            )
+        else:
+            raise
+    return json.loads(clean_json_response(response.text))
+
+
 def generate_briefing_with_gemini(
     articles: List[Dict[str, Any]], now_kst: datetime | None = None
 ) -> Dict[str, Any]:
@@ -295,12 +392,10 @@ def generate_briefing_with_gemini(
     weekday_ko = ["월", "화", "수", "목", "금", "토", "일"][now_kst.weekday()]
 
     from google import genai
-    from google.genai import types
 
-    # Stage 1 대용량 JSON 생성(약 3~4.5분 소요)을 위해 330초(5.5분) 타임아웃 설정
     client = genai.Client(
         api_key=GEMINI_API_KEY,
-        http_options={"api_version": "v1beta", "timeout": 330000},
+        http_options={"api_version": "v1beta", "timeout": 300000},
     )
     curation_prompt = build_curation_prompt(articles, date_str, weekday_ko)
 
@@ -308,23 +403,16 @@ def generate_briefing_with_gemini(
     briefing = None
 
     for model_name in candidate_models[:4]:
-        # 503 일시적 과부하 대비 모델당 최대 2회 시도
         for attempt in range(2):
             try:
                 logger.info(
-                    f"[Gemini] {model_name} 모델로 20대 뉴스 선별 및 92턴 초구어체 대본 생성 중 (시도 {attempt+1}/2, 최대 5.5분)..."
+                    f"[Gemini] {model_name} 모델로 20대 뉴스 선별 및 92턴 초구어체 대본 생성 중 (시도 {attempt+1}/2)..."
                 )
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=curation_prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        max_output_tokens=16384,
-                        temperature=0.55,
-                        http_options=types.HttpOptions(timeout=330000),
-                    ),
+                briefing = _call_gemini_curation(
+                    client=client,
+                    model_name=model_name,
+                    prompt=curation_prompt,
                 )
-                briefing = json.loads(clean_json_response(response.text))
                 if briefing and briefing.get("news_items"):
                     logger.info(
                         f"[Gemini] {model_name} 호출 성공! (뉴스 {len(briefing.get('news_items', []))}개)"
@@ -343,7 +431,8 @@ def generate_briefing_with_gemini(
             break
 
     if not briefing or not briefing.get("news_items"):
-        raise RuntimeError("Gemini 뉴스 및 대본 생성에 실패했습니다.")
+        logger.warning("[Gemini] 모든 모델 응답 지연으로 실시간 RSS 기반 비상 구어체 브리핑을 생성합니다.")
+        briefing = build_emergency_briefing_from_articles(articles, date_str, weekday_ko)
 
     full_dialogue = assemble_colloquial_dialogue(briefing, weekday_ko)
     logger.info(f"[Podcast Script] 총 {len(full_dialogue)}턴의 초구어체 2인 팟캐스트 대본 조립 완료!")
